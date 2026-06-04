@@ -55,6 +55,10 @@ _INPUT_PARSING_SYSTEM = """당신은 정산 데이터 파서입니다.
    - "동아리에서 지원받았어 / 회비로 충당 / 협찬 N만원 / 지원금 N만원"
      → 최상위 subsidy: 금액 을 넣는다. 금액 불명확하면 생략한다.
 
+   [최종 금액 지정] (특정인의 최종 부담액을 콕 집어 못박는 경우)
+   - "A는 2만원만 내 / A는 20000원으로 고정"
+     → 해당 참여자에 fixed_amount: 금액 을 넣는다. discount_rate로 바꾸지 말 것. 불명확하면 생략한다.
+
    주의: 받을 사람·송금액·정산 결과는 절대 계산하지 말 것. 추출만 한다.
 
 반드시 유효한 JSON만 반환하라. 설명 없이 JSON만 출력하라.
@@ -180,7 +184,41 @@ _FEEDBACK_PARSING_SYSTEM = """기존 정산 정보에 피드백을 반영하라.
 - 지원금 언급 없으면 기존 subsidy를 그대로 유지한다.
 - 선결제/지원금 수정 때문에 기존 participants/items/exceptions를 삭제하지 말 것.
 
+최종 금액 직접 지정(fixed_amount) 규칙:
+- "A는 2만원만 내게 해줘 / A는 20000원으로 고정 / B는 만원만 내" 처럼 특정인의 최종 부담액을
+  콕 집어 지정하면 → 해당 참여자 객체에 직접 "fixed_amount": 금액 키를 넣는다.
+  반드시 participants 원소의 최상위 키로 넣어라. exceptions 배열 안에 넣지 말 것.
+  올바른 예) {"name": "A", "fixed_amount": 10000, "exceptions": []}
+  잘못된 예) {"name": "A", "exceptions": [{"type": "fixed_amount", "amount": 10000}]}  ← 금지
+- fixed_amount는 그 사람의 '최종 부담액'을 강제한다. 나머지 사람에게 얼마가 가는지는 계산하지 말 것.
+- discount_rate로 바꾸지 말 것. 지정 해제("A 고정 풀어줘") 언급 시 fixed_amount 제거, 언급 없으면 유지.
+
+이력 일관성(중요):
+- 이전 피드백과 현재 피드백이 충돌하면, 가장 최근(현재) 지시를 우선한다.
+  예) 앞에서 "A 1만원 고정"이라 했고 지금 "A는 그냥 똑같이 내"라고 하면 → A의 fixed_amount 제거.
+- 현재 피드백에서 언급되지 않은 참여자/조건은 기존 값을 그대로 보존한다 (임의 변경 금지).
+
 - 수정된 전체 parsed_json을 반환하라. 설명 없이 JSON만 출력하라."""
+
+
+_FEEDBACK_INTENT_SYSTEM = """당신은 정산 피드백의 '의도'를 분류하는 분류기다.
+사용자가 이미 한 번 정산 결과를 받은 뒤 보낸 추가 메시지의 의도를 아래 셋 중 하나로만 판단하라.
+
+- "modify_exception": 기존 계산에 조건을 추가/수정하는 요청
+  예) "A가 10% 더 낸다고 했어", "D는 안주도 적게 먹었어", "C 지각비 5000원",
+      "A는 2만원만 내게 해줘"(최종 금액 지정도 수정 요청이다)
+- "reset": 기존 계산과 무관하게 완전히 새로운 정산을 시작하려는 요청
+  예) "다시 처음부터 할게", "새로운 정산이야", "방금 건 취소하고", "이번엔 3명이서 5만원인데"
+- "complaint": 결과에 불만/의문을 표현하지만 '구체적인 수정 조건'이 없는 경우
+  예) "계산이 이상한 것 같아", "왜 이렇게 나왔어?", "이거 맞아?", "다시 계산해봐"
+
+판단 원칙:
+- 구체적 숫자/조건(누가, 얼마, 몇 %)이 있으면 modify_exception 또는 reset이다. complaint가 아니다.
+- 새 인원·새 총액으로 처음부터 다시 하려는 신호가 강하면 reset이다.
+- 불만만 있고 무엇을 바꿔야 할지 정보가 없으면 complaint다.
+
+설명 없이 JSON만 출력하라. 형식:
+{"intent": "modify_exception"}"""
 
 
 def _call_llm(system: str, user: str, temperature: float = 0, *, tag: str = "") -> str:
@@ -221,6 +259,8 @@ def _post_validate_exceptions(parsed: dict) -> dict:
     all_item_names = [item["name"] for item in parsed.get("items", [])]
 
     for p in parsed.get("participants", []):
+        # LLM이 fixed_amount를 exceptions 안에 잘못 넣은 경우 참여자 레벨로 끌어올린다.
+        _hoist_fixed_amount(p)
         for exc in p.get("exceptions", []):
             exc_type = exc.get("type", "")
             if any(kw in exc_type for kw in SURCHARGE_KEYWORDS):
@@ -247,6 +287,29 @@ def _post_validate_exceptions(parsed: dict) -> dict:
     return parsed
 
 
+def _hoist_fixed_amount(participant: dict) -> None:
+    """LLM이 fixed_amount(최종 금액 지정)를 exceptions 배열 안에 잘못 넣은 경우
+    이를 참여자 레벨 `fixed_amount` 필드로 끌어올린다 (엔진은 이 필드만 인식한다).
+
+    교정 대상 패턴:
+      - {"fixed_amount": 10000}                  → participant["fixed_amount"] = 10000
+      - {"type": "fixed_amount", "amount": 10000} → participant["fixed_amount"] = 10000
+    """
+    excs = participant.get("exceptions", [])
+    remaining = []
+    for e in excs:
+        val = None
+        if "fixed_amount" in e:
+            val = e["fixed_amount"]
+        elif e.get("type") == "fixed_amount" and e.get("amount") is not None:
+            val = e["amount"]
+        if val is not None:
+            participant["fixed_amount"] = val
+        else:
+            remaining.append(e)
+    participant["exceptions"] = remaining
+
+
 def _merge_surcharge_exceptions(participant: dict) -> None:
     """한 참여자의 할증(지각 등) 예외가 둘 이상이면 가장 구체적인 것 하나로 병합한다.
 
@@ -269,6 +332,74 @@ def _merge_surcharge_exceptions(participant: dict) -> None:
     others = [e for e in excs if e is not best and "surcharge_rate" not in e and "surcharge_amount" not in e]
     participant["exceptions"] = others + [best]
 
+
+# ── 피드백 루프용 결정적 헬퍼 (LLM 미사용 — 단위 테스트 가능) ──────────────
+
+def _participant_overlap(old_names: list, new_names: list) -> float:
+    """두 참여자 명단의 자카드 유사도(0.0~1.0). 둘 중 하나가 비면 0.0."""
+    old, new = set(old_names), set(new_names)
+    if not old or not new:
+        return 0.0
+    return len(old & new) / len(old | new)
+
+
+def _build_complaint_clarification(cr: dict) -> str:
+    """complaint(불만) 의도일 때, 직전 결과에서 사용자가 의아해할 만한 규칙을
+    먼저 짚어 되묻는 메시지를 결정적으로 생성한다 (자가 진단, LLM 미사용).
+    """
+    fallback = (
+        "계산 결과에서 어떤 부분이 이상한지 알려주시면 바로 반영할게요.\n"
+        "예) 'A 금액이 너무 높아' 또는 'D가 술을 조금 마셨는데 안 반영됐어'"
+    )
+    if not cr:
+        return fallback
+
+    hints = []
+    floor = cr.get("floor_applied") or []
+    if floor:
+        hints.append(
+            f"{', '.join(floor)}님은 최소 부담 하한선(균등액의 30%)에 걸려 금액이 올라갔어요. 이 부분이 의아하셨을까요?"
+        )
+    surcharge_logs = cr.get("surcharge_logs") or {}
+    if surcharge_logs:
+        hints.append(
+            f"{', '.join(surcharge_logs.keys())}님께 지각/할증이 더해졌어요. 할증 조건이 잘못됐을까요?"
+        )
+    discount_logs = cr.get("discount_logs") or {}
+    multi = [n for n, logs in discount_logs.items() if len(logs) > 1]
+    if multi:
+        hints.append(
+            f"{', '.join(multi)}님은 여러 항목에서 감액이 겹쳐 적용됐어요. 이 부분일까요?"
+        )
+
+    if not hints:
+        return fallback
+    return (
+        "혹시 이런 부분이 궁금하셨나요?\n- "
+        + "\n- ".join(hints)
+        + "\n구체적으로 어디가 잘못됐는지 알려주시면 바로 고칠게요."
+    )
+
+
+def _build_change_summary(prev_amounts: dict, participants_out: list) -> str:
+    """직전 결과 대비 최종 금액 변동을 결정적으로 요약한다 (변경 사항 하이라이트).
+
+    prev_amounts: {이름: 직전 최종금액}, participants_out: 새 calculation_result["participants"].
+    변동이 없으면 빈 문자열을 반환한다.
+    """
+    if not prev_amounts:
+        return ""
+    lines = []
+    for p in participants_out:
+        name = p["name"]
+        new_amt = p["final_amount"]
+        old_amt = prev_amounts.get(name)
+        if old_amt is None or old_amt == new_amt:
+            continue
+        delta = new_amt - old_amt
+        sign = "+" if delta > 0 else "−"
+        lines.append(f"{name}: {old_amt:,}원 → {new_amt:,}원 ({sign}{abs(delta):,}원)")
+    return "\n".join(lines)
 
 
 def input_parsing_node(state: SettlementState) -> dict:
@@ -483,6 +614,17 @@ def report_generation_node(state: SettlementState) -> dict:
     pj = state.get("parsed_json", {})
     calc_explanation = _build_explanation(cr, pj) if cr else ""
 
+    # ── 변경 사항 하이라이트: 피드백 수정 시 직전 결과 대비 금액 변동 (결정적) ──
+    change_summary = ""
+    prev_calc = state.get("prev_calc") or {}
+    if prev_calc and cr.get("participants"):
+        prev_amounts = {p["name"]: p["final_amount"] for p in prev_calc.get("participants", [])}
+        change_summary = _build_change_summary(prev_amounts, cr["participants"])
+        if change_summary:
+            calc_explanation = (
+                "[직전 결과 대비 변경]\n" + change_summary + "\n\n" + calc_explanation
+            )
+
     settlement = cr.get("settlement")
     if settlement and settlement.get("has_prepaid"):
         # SPONSOR(선결제): 부담액이 아닌 송금 목록을 LLM에 전달 (산술 금지 유지)
@@ -516,19 +658,62 @@ def report_generation_node(state: SettlementState) -> dict:
         share_message = _call_llm(
             _SHARE_MESSAGE_SYSTEM, share_context, temperature=0.3, tag="SHARE_MSG"
         )
-    return {"calc_explanation": calc_explanation, "final_report": share_message}
+    return {
+        "calc_explanation": calc_explanation,
+        "final_report": share_message,
+        "change_summary": change_summary,
+    }
+
+
+def feedback_intent_node(state: SettlementState) -> dict:
+    """피드백 입력의 의도를 분류한다 (modify_exception / reset / complaint).
+
+    - complaint: 직전 결과를 자가 진단해 되묻기 메시지를 만들어 흐름을 종료한다.
+    - reset: 기존 이력을 비우고 새 정산(input_parsing)으로 라우팅한다.
+    - modify_exception: 기존 흐름(feedback_parsing)으로 진행한다.
+    """
+    raw = state["raw_input"]
+    content = _call_llm(_FEEDBACK_INTENT_SYSTEM, raw, temperature=0, tag="FEEDBACK_INTENT")
+    try:
+        intent = (_extract_json(content) or {}).get("intent", "modify_exception")
+    except Exception:
+        intent = "modify_exception"
+    if intent not in ("modify_exception", "reset", "complaint"):
+        intent = "modify_exception"
+
+    if intent == "complaint":
+        return {
+            "feedback_intent": "complaint",
+            "clarification_needed": _build_complaint_clarification(state.get("prev_calc", {})),
+        }
+    if intent == "reset":
+        # 새 정산으로 전환 — 기존 이력은 비운다 (parsed_json은 input_parsing이 덮어씀)
+        return {"feedback_intent": "reset", "feedback_history": []}
+    return {"feedback_intent": "modify_exception"}
 
 
 def feedback_parsing_node(state: SettlementState) -> dict:
+    old_pj = state.get("parsed_json", {})
+    old_names = [p["name"] for p in old_pj.get("participants", [])]
     history = state.get("feedback_history") or []
     history_text = "\n".join(history) if history else "(없음)"
     context = (
-        f"기존 정산 정보:\n{json.dumps(state.get('parsed_json', {}), ensure_ascii=False)}\n"
+        f"기존 정산 정보:\n{json.dumps(old_pj, ensure_ascii=False)}\n"
         f"이전 피드백 이력:\n{history_text}\n"
         f"새 피드백: {state['raw_input']}"
     )
     content = _call_llm(_FEEDBACK_PARSING_SYSTEM, context, tag="FEEDBACK_PARSING")
     updated_parsed = _extract_json(content)
     updated_parsed = _post_validate_exceptions(updated_parsed)
+    new_names = [p["name"] for p in updated_parsed.get("participants", [])]
+
+    # ── 오분류 가드(reset guard): 피드백이라지만 명단이 직전과 절반 이상 다르면
+    # 새 정산으로 간주한다. 기존 조건 오염을 막기 위해 원문을 input 프롬프트로 새로 파싱한다.
+    if old_names and _participant_overlap(old_names, new_names) < 0.5:
+        fresh = _post_validate_exceptions(
+            _extract_json(_call_llm(_INPUT_PARSING_SYSTEM, state["raw_input"], tag="INPUT_PARSING_RESET"))
+        )
+        return {"parsed_json": fresh, "feedback_history": [], "feedback_intent": "reset"}
+
     updated_history = list(history) + [state["raw_input"]]
     return {"parsed_json": updated_parsed, "feedback_history": updated_history}
