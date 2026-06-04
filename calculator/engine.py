@@ -21,6 +21,28 @@ def _validate(parsed_json: dict) -> None:
                 f"총액 불일치: items 합계({items_sum}) ≠ total_amount({parsed_json['total_amount']})"
             )
 
+    # ── 지원금(subsidy)·선결제(prepaid) 검증 (SPONSOR 레이어) ──
+    total_amount = parsed_json["total_amount"]
+    subsidy = parsed_json.get("subsidy", 0) or 0
+    if subsidy < 0:
+        raise ValueError("subsidy는 0 이상이어야 합니다")
+    if subsidy >= total_amount:
+        raise ValueError(
+            f"지원금({subsidy:,}원)이 총액({total_amount:,}원) 이상일 수 없습니다"
+        )
+    net_total = total_amount - subsidy
+
+    prepaid_sum = 0
+    for p in parsed_json["participants"]:
+        prepaid = p.get("prepaid", 0) or 0
+        if prepaid < 0:
+            raise ValueError(f"{p['name']}의 prepaid({prepaid})는 0 이상이어야 합니다")
+        prepaid_sum += prepaid
+    if prepaid_sum > net_total:
+        raise ValueError(
+            f"선결제 합({prepaid_sum:,}원)이 정산 대상액({net_total:,}원)을 초과합니다"
+        )
+
     for p in parsed_json["participants"]:
         for exc in p.get("exceptions", []):
             for key in ("discount_rate", "surcharge_rate"):
@@ -114,9 +136,13 @@ def _apply_steps_2_to_4(
     participants: list,
     total_amount: int,
     discount_logs: dict | None = None,
+    *,
+    subsidy: int = 0,
+    prepaid_map: dict | None = None,
 ) -> dict:
-    """Step 2(할증) → Step 3(하한선) → Step 4(반올림/검증)"""
+    """Step 2(할증) → Step 2.5(지원금) → Step 3(하한선) → Step 4(반올림/검증) → Step 5(송금)"""
     N = len(participants)
+    prepaid_map = prepaid_map or {}
 
     # Step 1 결과 스냅샷 — 할증 설명 시 LLM에 제공할 중간값
     step1_amounts = dict(amounts)
@@ -167,8 +193,17 @@ def _apply_steps_2_to_4(
                         "per_person": round(deduction),
                     }
 
+    # ── Step 2.5: 지원금(subsidy) 비례 축소 ──
+    # 외부 지원금만큼 총 부담을 줄인다. 각자 부담액을 net_total/total_amount 비율로 축소.
+    net_total = total_amount - subsidy
+    if subsidy > 0:
+        factor = net_total / total_amount
+        for n in amounts:
+            amounts[n] *= factor
+
     # ── Step 3: 하한선 적용 (균등 분담액의 30%) ──
-    base = total_amount / N
+    # subsidy가 없으면 net_total == total_amount 이므로 기존과 동일.
+    base = net_total / N
     floor = base * 0.3
     floor_applied = []
     total_floor_extra = 0.0
@@ -194,7 +229,7 @@ def _apply_steps_2_to_4(
 
     # ── Step 4: 반올림 및 총액 검증 ──
     int_amounts = {p["name"]: round(amounts[p["name"]]) for p in participants}
-    diff = total_amount - sum(int_amounts.values())
+    diff = net_total - sum(int_amounts.values())
     rounding_adjusted = None
     if diff != 0:
         fracs = {p["name"]: amounts[p["name"]] - int(amounts[p["name"]]) for p in participants}
@@ -206,20 +241,27 @@ def _apply_steps_2_to_4(
         int_amounts[adj] += diff
         rounding_adjusted = adj
 
-    total_verified = sum(int_amounts.values()) == total_amount
+    total_verified = sum(int_amounts.values()) == net_total
 
     # ── 결과 조립 ──
+    has_prepaid = any(prepaid_map.get(p["name"], 0) for p in participants)
+    has_sponsor = subsidy > 0 or has_prepaid
+
     participants_out = []
     for p in participants:
         name = p["name"]
-        participants_out.append({
+        entry = {
             "name": name,
             "final_amount": int_amounts[name],
             "breakdown": {
                 "base": int(base),
                 "step1_amount": round(step1_amounts[name]),
             },
-        })
+        }
+        # 순정산액(net)은 선결제가 있을 때만 의미가 있다 (= 부담액 − 선결제)
+        if has_prepaid:
+            entry["net_amount"] = int_amounts[name] - prepaid_map.get(name, 0)
+        participants_out.append(entry)
 
     result = {
         "participants": participants_out,
@@ -233,7 +275,88 @@ def _apply_steps_2_to_4(
         result["surcharge_logs"] = surcharge_logs
     if surcharge_deductions:
         result["surcharge_deductions"] = surcharge_deductions
+    if has_sponsor:
+        result["settlement"] = _build_settlement(
+            participants_out, prepaid_map, subsidy, net_total, has_prepaid
+        )
     return result
+
+
+def _build_settlement(
+    participants_out: list,
+    prepaid_map: dict,
+    subsidy: int,
+    net_total: int,
+    has_prepaid: bool,
+) -> dict:
+    """Step 5: 순정산(net = 부담 − 선결제) 기반 송금 지시 생성 (그리디 매칭).
+
+    debtor(net>0, 더 낼 사람) → creditor(net<0, 받을 사람) 순으로 큰 금액끼리 매칭한다.
+    sum(prepaid) == net_total 이면 완전 매칭(balanced), 미달이면 잔액이 unsettled로 남는다.
+
+    선결제가 전혀 없으면(지원금만 있는 경우) 송금 정산이 성립하지 않으므로
+    transfers/unsettled를 비우고 balanced=True로 둔다 (각자 자기 몫을 현장 결제).
+    """
+    positions = [
+        {
+            "name": p["name"],
+            "burden": p["final_amount"],
+            "prepaid": prepaid_map.get(p["name"], 0),
+            "net": p["final_amount"] - prepaid_map.get(p["name"], 0),
+        }
+        for p in participants_out
+    ]
+
+    if not has_prepaid:
+        return {
+            "subsidy": subsidy,
+            "net_total": net_total,
+            "has_prepaid": False,
+            "balanced": True,
+            "positions": positions,
+            "transfers": [],
+            "unsettled": [],
+        }
+
+    # net>0: 더 내야 함(debtor) / net<0: 받아야 함(creditor)
+    debtors = sorted(
+        ([p["name"], p["net"]] for p in positions if p["net"] > 0),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    creditors = sorted(
+        ([p["name"], -p["net"]] for p in positions if p["net"] < 0),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    transfers = []
+    i = j = 0
+    while i < len(debtors) and j < len(creditors):
+        d, c = debtors[i], creditors[j]
+        pay = min(d[1], c[1])
+        if pay > 0:
+            transfers.append({"from": d[0], "to": c[0], "amount": int(pay)})
+        d[1] -= pay
+        c[1] -= pay
+        if d[1] <= 0:
+            i += 1
+        if c[1] <= 0:
+            j += 1
+
+    # 받는 사람이 모두 소진됐는데 남은 debtor = 현장 결제분(미정산)
+    unsettled = [{"name": d[0], "amount": int(d[1])} for d in debtors[i:] if d[1] > 0]
+    balanced = not unsettled
+
+    return {
+        "subsidy": subsidy,
+        "net_total": net_total,
+        "has_prepaid": True,
+        "balanced": balanced,
+        "positions": positions,
+        "transfers": transfers,
+        "unsettled": unsettled,
+    }
 
 
 def calculate(parsed_json: dict) -> dict:
@@ -242,6 +365,8 @@ def calculate(parsed_json: dict) -> dict:
     total_amount = parsed_json["total_amount"]
     participants = parsed_json["participants"]
     items = parsed_json.get("items", [])
+    subsidy = parsed_json.get("subsidy", 0) or 0
+    prepaid_map = {p["name"]: p.get("prepaid", 0) or 0 for p in participants}
     N = len(participants)
 
     # ── Step 1: 항목별 실참여자 기준 비용 분할 ──
@@ -252,7 +377,10 @@ def calculate(parsed_json: dict) -> dict:
         amounts = {p["name"]: base for p in participants}
         discount_logs = {}
 
-    return _apply_steps_2_to_4(amounts, participants, total_amount, discount_logs)
+    return _apply_steps_2_to_4(
+        amounts, participants, total_amount, discount_logs,
+        subsidy=subsidy, prepaid_map=prepaid_map,
+    )
 
 
 def recalculate(parsed_json: dict, feedback_json: dict) -> dict:

@@ -44,6 +44,19 @@ _INPUT_PARSING_SYSTEM = """당신은 정산 데이터 파서입니다.
      - 비율도 금액도 미명시 → surcharge_rate: null
        예) "C는 늦게 왔어" → surcharge_rate: null
 
+   [선결제 조건] (감액/할증이 아니다 — 이미 누가 가게에 낸 돈)
+   - "A가 먼저 냈어 / A가 카드로 긁었어 / A가 쐈어 / A가 계산했어 / A가 다 결제했어"
+     → 해당 참여자에 prepaid: 금액 을 넣는다.
+   - 금액이 명시되면 그 값, "다/전부 냈어"처럼 전액이면 total_amount 값을 넣는다.
+   - 금액이 불명확하면 prepaid를 넣지 않는다(생략).
+   - 선결제는 participants[].exceptions에 넣지 말 것. prepaid 필드로만 표현한다.
+
+   [지원금 조건] (외부에서 들어와 총액을 깎는 돈)
+   - "동아리에서 지원받았어 / 회비로 충당 / 협찬 N만원 / 지원금 N만원"
+     → 최상위 subsidy: 금액 을 넣는다. 금액 불명확하면 생략한다.
+
+   주의: 받을 사람·송금액·정산 결과는 절대 계산하지 말 것. 추출만 한다.
+
 반드시 유효한 JSON만 반환하라. 설명 없이 JSON만 출력하라.
 
 출력 형식 예시 (지각비 5000원인 C, 술 미섭취 D):
@@ -69,15 +82,24 @@ _INPUT_PARSING_SYSTEM = """당신은 정산 데이터 파서입니다.
     {"name": "D", "exceptions": [{"type": "술 미섭취", "target_items": ["주류"], "discount_rate": 1.0}]},
     {"name": "E", "exceptions": [{"type": "소량 섭취", "target_items": ["안주"], "discount_rate": 0.7}]}
   ]
+}
+
+출력 형식 예시 (A가 전액 선결제, 동아리 지원금 2만원, 술 미섭취 D):
+{
+  "total_amount": 120000,
+  "subsidy": 20000,
+  "items": [{"name": "주류", "amount": 50000}, {"name": "안주", "amount": 50000}, {"name": "공통비", "amount": 20000}],
+  "participants": [
+    {"name": "A", "prepaid": 120000, "exceptions": []},
+    {"name": "B", "exceptions": []},
+    {"name": "C", "exceptions": []},
+    {"name": "D", "exceptions": [{"type": "술 미섭취", "target_items": ["주류"], "discount_rate": 1.0}]},
+    {"name": "E", "exceptions": []}
+  ]
 }"""
 
-_ROUTE_REQUEST_SYSTEM = """정산 전략을 결정하라. 단어 기반이 아닌 문맥 기반으로 판단하라.
-규칙:
-- 예외 조건(지각, 술 미섭취, 중도 귀가, 소량 섭취 등)이 하나라도 있으면 EXCEPTION
-- 그 외에는 SIMPLE
-
-반드시 다음 JSON만 반환하라. 설명 없이 JSON만 출력하라:
-{"strategy": "SIMPLE" | "EXCEPTION"}"""
+# 전략 분기는 route_request_node에서 결정적 코드로 판정한다 (LLM 미사용).
+# SIMPLE / EXCEPTION / SPONSOR — parsed_json의 prepaid·subsidy·exceptions 유무로 확정.
 
 _SHARE_MESSAGE_SYSTEM = """아래 [최종 정산 금액] 목록만을 사용하여 카카오톡에 붙여넣을 공유 메시지를 작성하라.
 
@@ -92,6 +114,44 @@ _SHARE_MESSAGE_SYSTEM = """아래 [최종 정산 금액] 목록만을 사용하�
 - [최종 정산 금액] 목록에 없는 수치를 임의로 추가하거나 계산하지 말라.
 - 산술 계산을 절대 수행하지 말라. 금액 합산, 차감, 퍼센트 계산 등 모든 연산 금지. (예: 20,000 + 4,000 = 27,000 같은 오류 발생 원인)
 - 왜 금액이 다른지 설명하지 말라. 최종 금액 나열만 허용한다."""
+
+_SHARE_MESSAGE_SPONSOR_SYSTEM = """아래 [입력]에 주어진 줄만 사용해 카카오톡 공유용 정산 메시지를 작성하라.
+
+규칙:
+- [입력]에 있는 줄만 반영하라. 인사말과 이모지만 덧붙이고, 새 항목·숫자를 만들지 말라.
+- [입력]에 없는 항목은 추가하지 말라. 숫자를 새로 계산하거나 바꾸지 말라.
+- 송금 목록은 "보내는사람 → 받는사람: 금액" 형식으로 그대로 나열하라.
+- [미정산 잔액]이 [입력]에 있으면 "현장 결제분 N원은 별도" 한 줄로 안내하라. 없으면 언급 금지.
+- **메시지는 단 하나만 출력하라.** 여러 버전, "최종 답변", 규칙·주석(※ 괄호 설명 등)을 출력하지 말라.
+
+[입력] 예시 1:
+[선결제]
+  A: 120,000원 선결제
+[송금 목록]
+  B → A: 28,250원
+  C → A: 28,250원
+
+출력 1:
+💳 정산 안내
+A님이 120,000원 먼저 결제했어요! 아래대로 송금 부탁드려요 🙏
+- B → A: 28,250원
+- C → A: 28,250원
+
+[입력] 예시 2:
+[선결제]
+  A: 50,000원 선결제
+[송금 목록]
+  B → A: 20,000원
+  C → A: 10,000원
+[미정산 잔액]
+  10,000원 (현장 결제분)
+
+출력 2:
+💳 정산 안내
+A님이 50,000원 먼저 결제했어요! 아래대로 송금 부탁드려요 🙏
+- B → A: 20,000원
+- C → A: 10,000원
+※ 현장 결제분 10,000원은 별도입니다."""
 
 _FEEDBACK_PARSING_SYSTEM = """기존 정산 정보에 피드백을 반영하라.
 규칙:
@@ -112,6 +172,14 @@ _FEEDBACK_PARSING_SYSTEM = """기존 정산 정보에 피드백을 반영하라.
 
 - 금액 명시 시 surcharge_amount, 비율 명시 시 surcharge_rate (둘을 동시에 쓰지 말라)
 - 모든 rate는 0.0~1.0 범위, surcharge_amount는 0 이상 정수로 결정하라
+
+선결제(prepaid)·지원금(subsidy) 관련 규칙:
+- 새 선결제 언급("A가 먼저 냈어") → 해당 참여자에 prepaid 추가. 언급 없으면 기존 prepaid 유지.
+- "A가 아니라 B가 냈어" → 기존 prepaid를 A에서 제거하고 B에 옮긴다.
+- "5만원이 아니라 6만원" → 기존 prepaid 금액만 수정한다.
+- 지원금 언급 없으면 기존 subsidy를 그대로 유지한다.
+- 선결제/지원금 수정 때문에 기존 participants/items/exceptions를 삭제하지 말 것.
+
 - 수정된 전체 parsed_json을 반환하라. 설명 없이 JSON만 출력하라."""
 
 
@@ -272,17 +340,46 @@ def safety_check_node(state: SettlementState) -> dict:
             "예) \"지각자는 20% 더 내기로 했어\" 또는 \"지각비 5000원\" 형태로 알려주세요."
         )
 
+    # ── 선결제(prepaid)·지원금(subsidy) 검증 (SPONSOR 레이어) ──
+    total_amount = pj.get("total_amount", 0)
+    subsidy = pj.get("subsidy", 0) or 0
+    if subsidy < 0 or subsidy >= total_amount:
+        return _exit(
+            "지원금 금액이 올바르지 않습니다 (총액 미만의 양수여야 합니다).\n"
+            "예) \"동아리에서 2만원 지원받았어\""
+        )
+    net_total = total_amount - subsidy
+    prepaid_sum = sum(p.get("prepaid", 0) or 0 for p in pj.get("participants", []))
+    if prepaid_sum > net_total:
+        return _exit(
+            f"선결제 합({prepaid_sum:,}원)이 정산 대상액({net_total:,}원)을 초과합니다.\n"
+            "선결제 금액을 다시 확인해주세요."
+        )
+    # 0 < prepaid_sum < net_total 은 정상 — 현장 결제분(미정산)으로 안내된다.
+
     return _exit("")
 
 
 def route_request_node(state: SettlementState) -> dict:
-    user = (
-        f"원문: {state['raw_input']}\n"
-        f"파싱 결과: {json.dumps(state.get('parsed_json', {}), ensure_ascii=False)}"
-    )
-    content = _call_llm(_ROUTE_REQUEST_SYSTEM, user, tag="ROUTE_REQUEST")
-    result = _extract_json(content)
-    return {"strategy": result.get("strategy", "SIMPLE")}
+    """전략 분기 (결정적). parsed_json만 보면 판정이 확정되므로 LLM을 쓰지 않는다.
+
+    - 선결제(prepaid) 또는 지원금(subsidy)이 있으면 SPONSOR (예외 파이프라인의 상위집합)
+    - 그 외 예외 조건이 하나라도 있으면 EXCEPTION
+    - 아무 예외도 없으면 SIMPLE
+    """
+    pj = state.get("parsed_json", {})
+    participants = pj.get("participants", [])
+    has_subsidy = bool(pj.get("subsidy", 0))
+    has_prepaid = any(p.get("prepaid", 0) for p in participants)
+    has_exception = any(p.get("exceptions") for p in participants)
+
+    if has_subsidy or has_prepaid:
+        strategy = "SPONSOR"
+    elif has_exception:
+        strategy = "EXCEPTION"
+    else:
+        strategy = "SIMPLE"
+    return {"strategy": strategy}
 
 
 def calculation_node(state: SettlementState) -> dict:
@@ -343,6 +440,37 @@ def _build_explanation(cr: dict, parsed_json: dict) -> str:
         lines.append(f"  - {p['name']}: {p['final_amount']:,}원")
     lines.append(f"  합계: {sum(p['final_amount'] for p in participants):,}원 ✓")
 
+    # ── 선결제·지원금·송금 안내 (SPONSOR) ──
+    settlement = cr.get("settlement")
+    if settlement:
+        if settlement.get("subsidy"):
+            lines.append("")
+            lines.append(
+                f"※ 지원금 {settlement['subsidy']:,}원 차감 "
+                f"(정산 대상액 {settlement['net_total']:,}원)"
+            )
+
+        if settlement.get("has_prepaid"):
+            prepaid_positions = [
+                pos for pos in settlement.get("positions", []) if pos.get("prepaid")
+            ]
+            if prepaid_positions:
+                lines.append("")
+                lines.append("선결제")
+                for pos in prepaid_positions:
+                    lines.append(f"  - {pos['name']}: {pos['prepaid']:,}원 선결제")
+
+            step += 1
+            lines.append("")
+            lines.append(f"{step}. 송금 안내 (순정산: 부담액 − 선결제)")
+            for t in settlement.get("transfers", []):
+                lines.append(f"  - {t['from']} → {t['to']}: {t['amount']:,}원")
+            if settlement.get("balanced"):
+                lines.append("  ✓ 선결제로 완전 정산")
+            else:
+                unsettled_total = sum(u["amount"] for u in settlement.get("unsettled", []))
+                lines.append(f"  ⚠️ 미정산 잔액 {unsettled_total:,}원 (현장 결제분)")
+
     floor = cr.get("floor_applied", [])
     if floor:
         lines.append(f"\n※ 최소 부담 하한선(30%) 적용: {', '.join(floor)}")
@@ -352,16 +480,42 @@ def _build_explanation(cr: dict, parsed_json: dict) -> str:
 
 def report_generation_node(state: SettlementState) -> dict:
     cr = state.get("calculation_result", {})
-    print("[CR]", json.dumps(cr, ensure_ascii=False, indent=2))
     pj = state.get("parsed_json", {})
     calc_explanation = _build_explanation(cr, pj) if cr else ""
 
-    finals = "\n".join(
-        f"  {p['name']}: {p['final_amount']:,}원"
-        for p in cr.get("participants", [])
-    )
-    share_context = f"[최종 정산 금액]\n{finals}"
-    share_message = _call_llm(_SHARE_MESSAGE_SYSTEM, share_context, temperature=0.3, tag="SHARE_MSG")
+    settlement = cr.get("settlement")
+    if settlement and settlement.get("has_prepaid"):
+        # SPONSOR(선결제): 부담액이 아닌 송금 목록을 LLM에 전달 (산술 금지 유지)
+        ctx_parts = []
+        if settlement.get("subsidy"):
+            ctx_parts.append(f"[지원금]\n  {settlement['subsidy']:,}원 반영")
+        prepaid_lines = [
+            f"  {pos['name']}: {pos['prepaid']:,}원 선결제"
+            for pos in settlement.get("positions", []) if pos.get("prepaid")
+        ]
+        if prepaid_lines:
+            ctx_parts.append("[선결제]\n" + "\n".join(prepaid_lines))
+        transfer_lines = [
+            f"  {t['from']} → {t['to']}: {t['amount']:,}원"
+            for t in settlement.get("transfers", [])
+        ]
+        ctx_parts.append("[송금 목록]\n" + ("\n".join(transfer_lines) or "  (없음)"))
+        if not settlement.get("balanced"):
+            unsettled_total = sum(u["amount"] for u in settlement.get("unsettled", []))
+            ctx_parts.append(f"[미정산 잔액]\n  {unsettled_total:,}원 (현장 결제분)")
+        share_context = "[입력]\n" + "\n".join(ctx_parts)
+        share_message = _call_llm(
+            _SHARE_MESSAGE_SPONSOR_SYSTEM, share_context, temperature=0.2, tag="SHARE_MSG_SPONSOR"
+        )
+    else:
+        finals = "\n".join(
+            f"  {p['name']}: {p['final_amount']:,}원"
+            for p in cr.get("participants", [])
+        )
+        share_context = f"[최종 정산 금액]\n{finals}"
+        share_message = _call_llm(
+            _SHARE_MESSAGE_SYSTEM, share_context, temperature=0.3, tag="SHARE_MSG"
+        )
     return {"calc_explanation": calc_explanation, "final_report": share_message}
 
 

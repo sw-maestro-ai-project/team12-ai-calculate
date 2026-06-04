@@ -219,3 +219,136 @@ def test_scenario_c_d_pays_less_than_b():
     d_b = next(p["final_amount"] for p in result_b["participants"] if p["name"] == "D")
     d_c = next(p["final_amount"] for p in result_c["participants"] if p["name"] == "D")
     assert d_c < d_b
+
+
+# ── SPONSOR 레이어 (선결제·지원금·송금정산) ────────────────────────────────
+
+# docs/sponsor.md §8 워크드 예시: 5명/120,000, D 주류 미섭취(1.0), E 안주 소량(0.7), A 전액 선결제
+INPUT_SPONSOR = {
+    "total_amount": 120000,
+    "items": [
+        {"name": "주류", "amount": 50000},
+        {"name": "안주", "amount": 50000},
+        {"name": "공통비", "amount": 20000},
+    ],
+    "participants": [
+        {"name": "A", "prepaid": 120000, "exceptions": []},
+        {"name": "B", "exceptions": []},
+        {"name": "C", "exceptions": []},
+        {"name": "D", "exceptions": [
+            {"type": "술 미섭취", "target_items": ["주류"], "discount_rate": 1.0}
+        ]},
+        {"name": "E", "exceptions": [
+            {"type": "소량 섭취", "target_items": ["안주"], "discount_rate": 0.7}
+        ]},
+    ],
+}
+
+
+def test_no_sponsor_omits_settlement():
+    """불변식 1: prepaid/subsidy 없으면 settlement·net_amount 미출력 (하위호환)."""
+    result = calculate(INPUT_B)
+    assert "settlement" not in result
+    assert all("net_amount" not in p for p in result["participants"])
+
+
+def test_sponsor_burden_amounts_match_doc():
+    """§8 부담액 기준값: A/B/C=28,250, D=15,750, E=19,500."""
+    result = calculate(INPUT_SPONSOR)
+    amounts = {p["name"]: p["final_amount"] for p in result["participants"]}
+    assert amounts["A"] == 28250
+    assert amounts["B"] == 28250
+    assert amounts["C"] == 28250
+    assert amounts["D"] == 15750
+    assert amounts["E"] == 19500
+    assert result["total_verified"] is True
+    assert sum(amounts.values()) == 120000
+
+
+def test_sponsor_net_and_balanced():
+    """§8 순정산: A=−91,750, sum(net)==0, balanced."""
+    result = calculate(INPUT_SPONSOR)
+    nets = {p["name"]: p["net_amount"] for p in result["participants"]}
+    assert nets["A"] == -91750
+    assert sum(nets.values()) == 0
+    settlement = result["settlement"]
+    assert settlement["balanced"] is True
+    assert settlement["unsettled"] == []
+
+
+def test_sponsor_transfers_all_to_payer():
+    """§8 송금: B/C→A 28,250, D→A 15,750, E→A 19,500 (총 91,750)."""
+    result = calculate(INPUT_SPONSOR)
+    transfers = result["settlement"]["transfers"]
+    # 모든 송금은 A(전액 선결제자)에게 향한다
+    assert all(t["to"] == "A" for t in transfers)
+    by_payer = {t["from"]: t["amount"] for t in transfers}
+    assert by_payer["B"] == 28250
+    assert by_payer["C"] == 28250
+    assert by_payer["D"] == 15750
+    assert by_payer["E"] == 19500
+    assert sum(t["amount"] for t in transfers) == 91750
+
+
+def test_subsidy_reduces_total_burden():
+    """지원금 3만원 → 부담 총합 == total − subsidy, 총액 검증 통과."""
+    parsed = {
+        "total_amount": 120000,
+        "subsidy": 30000,
+        "items": [
+            {"name": "주류", "amount": 50000},
+            {"name": "안주", "amount": 50000},
+            {"name": "공통비", "amount": 20000},
+        ],
+        "participants": [
+            {"name": "A", "exceptions": []},
+            {"name": "B", "exceptions": []},
+            {"name": "C", "exceptions": []},
+        ],
+    }
+    result = calculate(parsed)
+    assert sum(p["final_amount"] for p in result["participants"]) == 90000
+    assert result["total_verified"] is True
+    assert result["settlement"]["net_total"] == 90000
+
+
+def test_prepaid_shortfall_unsettled():
+    """선결제 미달(A 5만만 선결제) → unsettled 존재, balanced False (에러 아님)."""
+    parsed = {
+        "total_amount": 60000,
+        "items": [{"name": "식사", "amount": 60000}],
+        "participants": [
+            {"name": "A", "prepaid": 50000, "exceptions": []},
+            {"name": "B", "exceptions": []},
+            {"name": "C", "exceptions": []},
+        ],
+    }
+    result = calculate(parsed)
+    # 각 부담 20,000. A net=20,000−50,000=−30,000(받을), B/C net=+20,000
+    settlement = result["settlement"]
+    assert settlement["balanced"] is False
+    assert settlement["unsettled"]  # 남은 현장 결제분 존재
+    unsettled_total = sum(u["amount"] for u in settlement["unsettled"])
+    assert unsettled_total == 10000  # B/C 40,000 중 A가 30,000만 회수 → 10,000 미정산
+
+
+def test_prepaid_over_net_total_raises():
+    """선결제 합이 정산 대상액 초과 → ValueError."""
+    with pytest.raises(ValueError, match="선결제"):
+        calculate({
+            "total_amount": 60000,
+            "participants": [
+                {"name": "A", "prepaid": 50000, "exceptions": []},
+                {"name": "B", "prepaid": 20000, "exceptions": []},
+            ],
+        })
+
+
+def test_subsidy_over_total_raises():
+    """지원금이 총액 이상 → ValueError."""
+    with pytest.raises(ValueError, match="지원금"):
+        calculate({
+            "total_amount": 60000,
+            "subsidy": 60000,
+            "participants": [{"name": "A", "exceptions": []}],
+        })
