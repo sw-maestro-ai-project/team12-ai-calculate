@@ -36,6 +36,16 @@ html, body, [class*="css"] {
 }
 .badge-simple    { background:#DCFCE7; color:#166534; }
 .badge-exception { background:#FEF3C7; color:#92400E; }
+.badge-sponsor   { background:#E0E7FF; color:#3730A3; }
+
+/* Transfer (송금) row */
+.transfer-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 16px; border-radius: 10px;
+    background: #EEF2FF; border: 1px solid #C7D2FE; margin-bottom: 6px;
+}
+.transfer-route  { font-size: 0.95rem; font-weight: 600; color: #3730A3; }
+.transfer-amount { font-size: 1.05rem; font-weight: 700; color: #4338CA; }
 
 /* Participant card */
 .participant-row {
@@ -112,6 +122,18 @@ _EXAMPLES = [
         "desc": "특정 인원 비용 전액 면제",
         "prompt": "총 15만원이야. 주류 5만원, 안주 10만원. A, B, C, D, E 5명이고 오늘 A 생일이라 A는 안 내도 돼.",
     },
+    {
+        "icon": "💳",
+        "title": "선결제 정산",
+        "desc": "A가 전액 결제 · 송금 안내",
+        "prompt": "총 12만원이야. 주류 5만, 안주 5만, 공통비 2만. A, B, C, D, E 5명. D는 술 안 마셨고 E는 안주 거의 안 먹었어. A가 다 계산했어.",
+    },
+    {
+        "icon": "🎟️",
+        "title": "지원금 포함",
+        "desc": "외부 지원금으로 총액 차감",
+        "prompt": "총 12만원이고 A, B, C, D 4명. 주류 6만, 안주 6만. 동아리에서 4만원 지원받았어.",
+    },
 ]
 
 
@@ -177,6 +199,7 @@ def _render_result(msg: dict) -> None:
     badge_cfg = {
         "SIMPLE":    ("badge-simple",    "균등 분배"),
         "EXCEPTION": ("badge-exception", "⚡ 예외 조건 반영"),
+        "SPONSOR":   ("badge-sponsor",   "💳 선결제 정산"),
     }
     badge_class, badge_label = badge_cfg.get(strategy, ("badge-simple", strategy))
     st.markdown(
@@ -184,15 +207,48 @@ def _render_result(msg: dict) -> None:
         unsafe_allow_html=True,
     )
 
+    settlement = cr.get("settlement")
+    prepaid_by_name = {
+        pos["name"]: pos.get("prepaid", 0)
+        for pos in (settlement.get("positions", []) if settlement else [])
+    }
+
     st.markdown('<div class="section-header">정산 결과</div>', unsafe_allow_html=True)
     for p in participants:
-        _card(p["name"], f"{p['final_amount']:,}원", _exception_notes(p))
+        note = _exception_notes(p)
+        prepaid = prepaid_by_name.get(p["name"], 0)
+        if prepaid:
+            extra = f"💳 {prepaid:,}원 선결제"
+            note = f"{note} · {extra}" if note else extra
+        _card(p["name"], f"{p['final_amount']:,}원", note)
 
     floor_applied = cr.get("floor_applied", [])
     if floor_applied:
         st.caption(f"💡 최소 부담 하한선(30%) 적용: {', '.join(floor_applied)}")
     if not cr.get("total_verified", True):
         st.warning("총액 검증 불일치가 감지되었습니다.")
+
+    # ── 지원금 안내 ──
+    if settlement and settlement.get("subsidy"):
+        st.caption(
+            f"🎟️ 지원금 {settlement['subsidy']:,}원 반영 "
+            f"(정산 대상액 {settlement['net_total']:,}원)"
+        )
+
+    # ── 송금 안내 (선결제가 있을 때만) ──
+    if settlement and settlement.get("has_prepaid"):
+        st.markdown('<div class="section-header">송금 안내</div>', unsafe_allow_html=True)
+        for t in settlement.get("transfers", []):
+            st.markdown(
+                f'<div class="transfer-row"><div class="transfer-route">{t["from"]} ──▶ {t["to"]}</div>'
+                f'<div class="transfer-amount">{t["amount"]:,}원</div></div>',
+                unsafe_allow_html=True,
+            )
+        if settlement.get("balanced"):
+            st.success("✅ 선결제로 완전 정산됩니다.")
+        else:
+            unsettled_total = sum(u["amount"] for u in settlement.get("unsettled", []))
+            st.warning(f"⚠️ 미정산 잔액 {unsettled_total:,}원 (현장에서 결제된 몫)")
 
     calc_explanation = msg.get("calc_explanation", "")
     if calc_explanation:
