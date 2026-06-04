@@ -241,11 +241,50 @@ def _extract_json(text: str) -> dict:
     return json.loads(text.strip())
 
 
+# 동의어 → 실제 항목명 후보 (부분 문자열로 매칭). 항목이 실제로 존재할 때만 매핑한다.
+ITEM_SYNONYMS = {
+    "주류": ["술", "맥주", "소주", "주류", "음주"],
+    "안주": ["안주", "음식", "고기", "food", "메뉴"],
+}
+
+
+def _normalize_target_items(parsed: dict) -> dict:
+    """예외 조건의 target_items 이름을 실제 항목명으로 교정한다 (보정 단계).
+
+    LLM이 "술/고기"처럼 항목명과 다르게 써도 실제 items 이름으로 맞춰, 감액/할증이
+    조용히 누락되는 것을 막는다. 매핑에 실패하면 원본을 그대로 두어 이후
+    safety_check_node가 차단하게 한다. 없는 항목을 새로 만들어내지 않는다.
+    """
+    item_names = [i["name"] for i in parsed.get("items", [])]
+    if not item_names:
+        return parsed
+
+    def _map_one(token: str) -> str:
+        if token in item_names:
+            return token
+        # 1) 동의어 사전으로 실제 항목명 추정 (항목명이 실제로 존재할 때만)
+        for canonical, syns in ITEM_SYNONYMS.items():
+            if canonical in item_names and any(s in token or token in s for s in syns):
+                return canonical
+        # 2) 부분 문자열 일치(예: "주류값" → "주류", "공통" → "공통비")
+        for name in item_names:
+            if name in token or token in name:
+                return name
+        return token  # 매핑 실패 → 원본 유지 (이후 safety_check가 차단)
+
+    for p in parsed.get("participants", []):
+        for exc in p.get("exceptions", []):
+            if exc.get("target_items"):
+                exc["target_items"] = [_map_one(t) for t in exc["target_items"]]
+    return parsed
+
+
 def _post_validate_exceptions(parsed: dict) -> dict:
     """LLM 분류 오류를 코드 레벨에서 보정한다.
 
     1. 지각/늦은 도착 → surcharge 교정 (discount_rate 잘못 분류 시 전환)
     2. discount_rate null → 타입 키워드로 rate 추론 교정
+    3. target_items 동의어 정규화 (술→주류 등)
     """
     SURCHARGE_KEYWORDS = {"지각", "늦은 도착", "늦게", "late", "지각비", "늦음", "늦은"}
     # 감액 키워드 → discount_rate 매핑 (모호한 null 보정용)
@@ -284,7 +323,8 @@ def _post_validate_exceptions(parsed: dict) -> dict:
         # 새 할증을 덧붙이는 경우 방어 — 가장 구체적인 값 하나만 남긴다)
         _merge_surcharge_exceptions(p)
 
-    return parsed
+    # target_items 동의어/오기 정규화 (검증 전 보정 — 실제 항목명으로 교정)
+    return _normalize_target_items(parsed)
 
 
 def _hoist_fixed_amount(participant: dict) -> None:
@@ -438,6 +478,25 @@ def safety_check_node(state: SettlementState) -> dict:
                         "비용 항목(주류, 안주 등)이 입력되지 않았는데 예외 조건에 항목이 지정되어 있습니다.\n"
                         "항목별 금액을 함께 알려주세요. 예) \"주류 3만원 / 안주 5만원\""
                     )
+
+    # ── target_items 이름이 실제 items에 존재하는지 검증 (silent failure 차단) ──
+    # 정규화(_normalize_target_items)로도 못 푼 항목명은 계산으로 넘기지 않고 되묻는다.
+    item_names = {i["name"] for i in pj.get("items", [])}
+    if item_names:
+        unknown = []
+        for p in pj.get("participants", []):
+            for exc in p.get("exceptions", []):
+                for t in exc.get("target_items", []):
+                    if t not in item_names:
+                        unknown.append((p["name"], t))
+        if unknown:
+            detail = ", ".join(f"{name}의 '{t}'" for name, t in unknown)
+            names_str = ", ".join(sorted(item_names))
+            return _exit(
+                f"예외 조건의 항목 이름이 입력한 비용 항목과 일치하지 않습니다: {detail}\n"
+                f"입력된 항목: {names_str}\n"
+                "어느 항목에 대한 조건인지 정확한 항목명으로 다시 알려주세요."
+            )
 
     # ── discount_rate null 감지 ──
     null_discount_names = []

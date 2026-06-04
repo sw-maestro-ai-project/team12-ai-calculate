@@ -444,3 +444,35 @@ def test_all_fixed_mismatch_raises():
                 {"name": "B", "exceptions": [], "fixed_amount": 20000},
             ],
         })
+
+
+# ── target_items 방어적 가드 (이름 불일치 silent failure 차단) ──────────────
+
+def test_unknown_target_item_raises():
+    """items에 없는 target_items('택시비') → 엔진이 ValueError로 차단."""
+    with pytest.raises(ValueError, match="target_items"):
+        calculate({
+            "total_amount": 80000,
+            "items": [{"name": "주류", "amount": 30000}, {"name": "안주", "amount": 50000}],
+            "participants": [
+                {"name": "A", "exceptions": []},
+                {"name": "D", "exceptions": [
+                    {"type": "술 미섭취", "target_items": ["택시비"], "discount_rate": 1.0}
+                ]},
+            ],
+        })
+
+
+def test_valid_target_item_passes():
+    """정상 항목명은 통과 (회귀 없음)."""
+    result = calculate({
+        "total_amount": 80000,
+        "items": [{"name": "주류", "amount": 30000}, {"name": "안주", "amount": 50000}],
+        "participants": [
+            {"name": "A", "exceptions": []},
+            {"name": "D", "exceptions": [
+                {"type": "술 미섭취", "target_items": ["주류"], "discount_rate": 1.0}
+            ]},
+        ],
+    })
+    assert result["total_verified"] is True
