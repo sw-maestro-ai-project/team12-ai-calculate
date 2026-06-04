@@ -150,6 +150,8 @@ def _invoke_graph(prompt: str) -> dict:
                 "parsed_json": prev["parsed_json"],
                 "strategy": prev.get("strategy", ""),
                 "feedback_history": prev.get("feedback_history") or [],
+                # 직전 결과 — 변경 하이라이트·불만(complaint) 자가 진단에 사용
+                "prev_calc": prev.get("calculation_result") or {},
             })
         else:
             result = graph.invoke({
@@ -188,6 +190,11 @@ def _render_result(msg: dict) -> None:
         st.warning(f"⚠️ {msg['safety_error']}\n\n입력 내용을 수정해 다시 시도해주세요.")
         return
 
+    # complaint(불만) 의도: 되묻기 메시지만 표시하고 종료
+    if msg.get("clarification_needed"):
+        st.info(f"💬 {msg['clarification_needed']}")
+        return
+
     cr = msg.get("calculation_result")
     if not cr or not cr.get("participants"):
         st.info("정산 결과를 처리하지 못했습니다.")
@@ -206,6 +213,12 @@ def _render_result(msg: dict) -> None:
         f'<span class="strategy-badge {badge_class}">{badge_label}</span>',
         unsafe_allow_html=True,
     )
+
+    # ── 변경 사항 하이라이트 (피드백 수정 시 직전 결과 대비 변동) ──
+    change_summary = msg.get("change_summary", "")
+    if change_summary:
+        st.markdown('<div class="section-header">✏️ 직전 결과 대비 변경</div>', unsafe_allow_html=True)
+        st.code(change_summary, language=None)
 
     settlement = cr.get("settlement")
     prepaid_by_name = {
@@ -312,6 +325,17 @@ if st.session_state.messages:
             with st.chat_message("assistant"):
                 _render_result(msg)
     st.markdown("---")
+
+# ── 피드백 모드 안내 (직전 계산이 있으면 현재 모드를 알려줌) ──────────
+_prev_assistant = next(
+    (m for m in reversed(st.session_state.messages) if m["role"] == "assistant"),
+    None,
+)
+if _prev_assistant and _prev_assistant.get("parsed_json", {}).get("participants"):
+    st.caption(
+        "💬 이전 계산에 조건을 추가하거나 수정할 수 있어요. "
+        "완전히 새로 시작하려면 \"처음부터 다시\"라고 입력하세요."
+    )
 
 # ── 입력 폼 (메시지 없으면 타이틀 바로 아래, 있으면 대화 아래) ────────
 with st.form("input_form", clear_on_submit=True, border=False):

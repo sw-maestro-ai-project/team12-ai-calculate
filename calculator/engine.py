@@ -43,6 +43,27 @@ def _validate(parsed_json: dict) -> None:
             f"선결제 합({prepaid_sum:,}원)이 정산 대상액({net_total:,}원)을 초과합니다"
         )
 
+    # ── 최종 금액 직접 지정(fixed_amount) 검증 (피드백 Direct Override) ──
+    fixed_sum = 0
+    n_fixed = 0
+    for p in parsed_json["participants"]:
+        fa = p.get("fixed_amount")
+        if fa is None:
+            continue
+        if fa < 0:
+            raise ValueError(f"{p['name']}의 fixed_amount({fa})는 0 이상이어야 합니다")
+        fixed_sum += fa
+        n_fixed += 1
+    if n_fixed:
+        if fixed_sum > net_total:
+            raise ValueError(
+                f"고정 금액 합({fixed_sum:,}원)이 정산 대상액({net_total:,}원)을 초과합니다"
+            )
+        if n_fixed == len(parsed_json["participants"]) and fixed_sum != net_total:
+            raise ValueError(
+                f"전원 고정 금액 합({fixed_sum:,}원)이 정산 대상액({net_total:,}원)과 일치해야 합니다"
+            )
+
     for p in parsed_json["participants"]:
         for exc in p.get("exceptions", []):
             for key in ("discount_rate", "surcharge_rate"):
@@ -201,38 +222,71 @@ def _apply_steps_2_to_4(
         for n in amounts:
             amounts[n] *= factor
 
+    # ── Step 2.7: 최종 금액 직접 지정(fixed_amount) 강제 (피드백 Direct Override) ──
+    # 사용자가 "A는 2만원만 내" 처럼 특정인의 최종 부담을 못박은 경우.
+    # 해당 인원은 그 값으로 고정하고, 차액을 나머지(비고정) 참여자에게 비례 재분배한다.
+    # 고정값이 명시되면 사용자 지정이 우선하므로 30% 하한선은 적용하지 않는다.
+    fixed_map = {
+        p["name"]: p["fixed_amount"]
+        for p in participants
+        if p.get("fixed_amount") is not None
+    }
+    has_fixed = bool(fixed_map)
+    if has_fixed:
+        for name, amt in fixed_map.items():
+            amounts[name] = float(amt)
+        free = [p["name"] for p in participants if p["name"] not in fixed_map]
+        remaining = net_total - sum(fixed_map.values())
+        if free:
+            free_sum = sum(amounts[n] for n in free)
+            if free_sum > 0:
+                factor = remaining / free_sum
+                for n in free:
+                    amounts[n] *= factor
+            else:
+                share = remaining / len(free)
+                for n in free:
+                    amounts[n] = share
+
     # ── Step 3: 하한선 적용 (균등 분담액의 30%) ──
     # subsidy가 없으면 net_total == total_amount 이므로 기존과 동일.
+    # fixed_amount가 지정된 경우엔 사용자 지정값을 보존하기 위해 하한선을 건너뛴다.
     base = net_total / N
     floor = base * 0.3
     floor_applied = []
     total_floor_extra = 0.0
 
-    for p in participants:
-        name = p["name"]
-        if amounts[name] == 0.0:
-            continue  # 전액 제외(discount_rate=1.0) → 하한선 미적용
-        if amounts[name] < floor:
-            total_floor_extra += floor - amounts[name]
-            amounts[name] = floor
-            floor_applied.append(name)
+    if not has_fixed:
+        for p in participants:
+            name = p["name"]
+            if amounts[name] == 0.0:
+                continue  # 전액 제외(discount_rate=1.0) → 하한선 미적용
+            if amounts[name] < floor:
+                total_floor_extra += floor - amounts[name]
+                amounts[name] = floor
+                floor_applied.append(name)
 
-    if total_floor_extra > 0:
-        non_floored = [p["name"] for p in participants if p["name"] not in floor_applied]
-        if non_floored:
-            total_non_floored = sum(amounts[n] for n in non_floored)
-            for n in non_floored:
-                if total_non_floored > 0:
-                    amounts[n] -= total_floor_extra * amounts[n] / total_non_floored
-                else:
-                    amounts[n] -= total_floor_extra / len(non_floored)
+        if total_floor_extra > 0:
+            non_floored = [p["name"] for p in participants if p["name"] not in floor_applied]
+            if non_floored:
+                total_non_floored = sum(amounts[n] for n in non_floored)
+                for n in non_floored:
+                    if total_non_floored > 0:
+                        amounts[n] -= total_floor_extra * amounts[n] / total_non_floored
+                    else:
+                        amounts[n] -= total_floor_extra / len(non_floored)
 
     # ── Step 4: 반올림 및 총액 검증 ──
     int_amounts = {p["name"]: round(amounts[p["name"]]) for p in participants}
     diff = net_total - sum(int_amounts.values())
     rounding_adjusted = None
     if diff != 0:
-        fracs = {p["name"]: amounts[p["name"]] - int(amounts[p["name"]]) for p in participants}
+        # 반올림 차액 보정 대상에서 고정 금액(fixed_amount) 참여자는 제외한다
+        # (사용자 지정값이 ±1원 틀어지지 않도록). 비고정 참여자가 없으면 전체 대상.
+        candidates = [p["name"] for p in participants if p["name"] not in fixed_map] or [
+            p["name"] for p in participants
+        ]
+        fracs = {n: amounts[n] - int(amounts[n]) for n in candidates}
         adj = (
             max(fracs, key=lambda n: fracs[n])
             if diff > 0

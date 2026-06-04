@@ -352,3 +352,95 @@ def test_subsidy_over_total_raises():
             "subsidy": 60000,
             "participants": [{"name": "A", "exceptions": []}],
         })
+
+
+# ── 최종 금액 직접 지정 (fixed_amount / 피드백 Direct Override) ──────────────
+
+def test_fixed_amount_pins_and_redistributes():
+    """A를 10,000원으로 고정 → 차액이 나머지에게 비례 재분배, 총합 보존."""
+    result = calculate({
+        "total_amount": 60000,
+        "participants": [
+            {"name": "A", "exceptions": [], "fixed_amount": 10000},
+            {"name": "B", "exceptions": []},
+            {"name": "C", "exceptions": []},
+        ],
+    })
+    amounts = {p["name"]: p["final_amount"] for p in result["participants"]}
+    assert amounts["A"] == 10000          # 고정값 정확히 보존
+    assert amounts["B"] == 25000          # (20000 → 20000×1.25) 비례 흡수
+    assert amounts["C"] == 25000
+    assert sum(amounts.values()) == 60000
+    assert result["total_verified"] is True
+
+
+def test_fixed_amount_skips_floor():
+    """고정값이 30% 하한선 미만이어도 사용자 지정이 우선 → 하한선 미적용."""
+    result = calculate({
+        "total_amount": 60000,
+        "participants": [
+            {"name": "A", "exceptions": [], "fixed_amount": 1000},  # 하한선(6,000) 미만
+            {"name": "B", "exceptions": []},
+            {"name": "C", "exceptions": []},
+        ],
+    })
+    amounts = {p["name"]: p["final_amount"] for p in result["participants"]}
+    assert amounts["A"] == 1000           # 하한선으로 끌어올리지 않음
+    assert result["floor_applied"] == []
+    assert sum(amounts.values()) == 60000
+
+
+def test_fixed_amount_with_items_preserves_total():
+    """항목이 있어도 고정값 보존 + 총액 검증 통과."""
+    result = calculate({
+        "total_amount": 80000,
+        "items": [{"name": "주류", "amount": 30000}, {"name": "안주", "amount": 50000}],
+        "participants": [
+            {"name": "A", "exceptions": [], "fixed_amount": 10000},
+            {"name": "B", "exceptions": []},
+            {"name": "C", "exceptions": []},
+            {"name": "D", "exceptions": []},
+        ],
+    })
+    amounts = {p["name"]: p["final_amount"] for p in result["participants"]}
+    assert amounts["A"] == 10000
+    assert sum(amounts.values()) == 80000
+    assert result["total_verified"] is True
+
+
+def test_all_fixed_must_match_total():
+    """전원 고정값 합이 정산 대상액과 같으면 그대로 통과."""
+    result = calculate({
+        "total_amount": 60000,
+        "participants": [
+            {"name": "A", "exceptions": [], "fixed_amount": 30000},
+            {"name": "B", "exceptions": [], "fixed_amount": 30000},
+        ],
+    })
+    amounts = {p["name"]: p["final_amount"] for p in result["participants"]}
+    assert amounts == {"A": 30000, "B": 30000}
+    assert result["total_verified"] is True
+
+
+def test_fixed_amount_over_net_total_raises():
+    """고정값이 정산 대상액 초과 → ValueError."""
+    with pytest.raises(ValueError, match="고정 금액"):
+        calculate({
+            "total_amount": 60000,
+            "participants": [
+                {"name": "A", "exceptions": [], "fixed_amount": 70000},
+                {"name": "B", "exceptions": []},
+            ],
+        })
+
+
+def test_all_fixed_mismatch_raises():
+    """전원 고정인데 합이 총액과 불일치 → ValueError."""
+    with pytest.raises(ValueError, match="고정 금액"):
+        calculate({
+            "total_amount": 60000,
+            "participants": [
+                {"name": "A", "exceptions": [], "fixed_amount": 20000},
+                {"name": "B", "exceptions": [], "fixed_amount": 20000},
+            ],
+        })
