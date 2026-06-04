@@ -21,6 +21,18 @@ def _validate(parsed_json: dict) -> None:
                 f"총액 불일치: items 합계({items_sum}) ≠ total_amount({parsed_json['total_amount']})"
             )
 
+        # 방어적 가드: target_items 이름이 실제 항목명에 없으면 차단
+        # (정상 흐름에선 ai/의 safety_check_node가 upstream에서 막지만,
+        #  엔진을 독립 호출/재사용할 때 silent failure를 방지한다)
+        item_names = {item["name"] for item in items}
+        for p in parsed_json["participants"]:
+            for exc in p.get("exceptions", []):
+                for t in exc.get("target_items", []):
+                    if t not in item_names:
+                        raise ValueError(
+                            f"{p['name']}의 target_items '{t}'가 항목 목록에 없습니다"
+                        )
+
     # ── 지원금(subsidy)·선결제(prepaid) 검증 (SPONSOR 레이어) ──
     total_amount = parsed_json["total_amount"]
     subsidy = parsed_json.get("subsidy", 0) or 0
