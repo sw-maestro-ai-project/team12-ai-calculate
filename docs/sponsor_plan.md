@@ -80,34 +80,38 @@ E는 늦게 도착해 안주를 거의 먹지 않았다.
 {
   "total_amount": 120000,
   "items": [
-    {"name": "주류", "amount": 50000},
-    {"name": "안주", "amount": 50000},
-    {"name": "공통비", "amount": 20000}
+    { "name": "주류", "amount": 50000 },
+    { "name": "안주", "amount": 50000 },
+    { "name": "공통비", "amount": 20000 }
   ],
   "participants": [
-    {"name": "A", "exceptions": []},
-    {"name": "B", "exceptions": []},
-    {"name": "C", "exceptions": []},
-    {"name": "D", "exceptions": [
-      {"type": "술 미섭취", "target_items": ["주류"], "discount_rate": 1.0}
-    ]},
-    {"name": "E", "exceptions": [
-      {"type": "소량 섭취", "target_items": ["안주"], "discount_rate": 0.7}
-    ]}
+    { "name": "A", "exceptions": [] },
+    { "name": "B", "exceptions": [] },
+    { "name": "C", "exceptions": [] },
+    {
+      "name": "D",
+      "exceptions": [
+        { "type": "술 미섭취", "target_items": ["주류"], "discount_rate": 1.0 }
+      ]
+    },
+    {
+      "name": "E",
+      "exceptions": [
+        { "type": "소량 섭취", "target_items": ["안주"], "discount_rate": 0.7 }
+      ]
+    }
   ],
-  "payments": [
-    {"payer": "A", "amount": 50000}
-  ]
+  "payments": [{ "payer": "A", "amount": 50000 }]
 }
 ```
 
 필드 의미:
 
-| 필드 | 의미 |
-|---|---|
-| `payments` | 선결제 목록 |
-| `payer` | 먼저 결제한 참여자 이름 |
-| `amount` | 먼저 결제한 금액 |
+| 필드       | 의미                    |
+| ---------- | ----------------------- |
+| `payments` | 선결제 목록             |
+| `payer`    | 먼저 결제한 참여자 이름 |
+| `amount`   | 먼저 결제한 금액        |
 
 `payments`는 선결제 정보만 담는다. `participants[].exceptions`에는 넣지 않는다.
 
@@ -209,12 +213,10 @@ route_request
 {
   "calculation_result": {
     "participants": [
-      {"name": "A", "final_amount": 25000},
-      {"name": "B", "final_amount": 30000}
+      { "name": "A", "final_amount": 25000 },
+      { "name": "B", "final_amount": 30000 }
     ],
-    "payments": [
-      {"payer": "A", "amount": 50000}
-    ],
+    "payments": [{ "payer": "A", "amount": 50000 }],
     "sponsor_summary": {
       "payer": "A",
       "paid_amount": 50000
@@ -235,10 +237,10 @@ route_request
 
 선결제 관련 최소 검증:
 
-| 조건 | 메시지 |
-|---|---|
-| `amount`가 null | `선결제 금액이 명확하지 않습니다. 예) "A가 5만원 먼저 냈어"` |
-| `payer`가 null | `선결제한 사람의 이름이 누락되었습니다. 예) "A가 5만원 먼저 냈어"` |
+| 조건                         | 메시지                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------ |
+| `amount`가 null              | `선결제 금액이 명확하지 않습니다. 예) "A가 5만원 먼저 냈어"`             |
+| `payer`가 null               | `선결제한 사람의 이름이 누락되었습니다. 예) "A가 5만원 먼저 냈어"`       |
 | `payer`가 참여자 목록에 없음 | `선결제자 {payer}가 참여자 목록에 없습니다. 참여자 이름을 확인해주세요.` |
 
 검증 위치는 둘 중 하나로 한다.
