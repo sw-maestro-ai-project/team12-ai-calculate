@@ -61,6 +61,11 @@ _INPUT_PARSING_SYSTEM = """당신은 정산 데이터 파서입니다.
 
    주의: 받을 사람·송금액·정산 결과는 절대 계산하지 말 것. 추출만 한다.
 
+[정산 무관 입력 처리]
+입력이 모임 비용 정산·더치페이·비용 분담과 전혀 관련이 없으면 (예: 여행지 추천, 날씨, 잡담 등)
+다른 필드 없이 아래 JSON 한 줄만 반환하라:
+{"off_topic": true}
+
 반드시 유효한 JSON만 반환하라. 설명 없이 JSON만 출력하라.
 
 출력 형식 예시 (지각비 5000원인 C, 술 미섭취 D):
@@ -164,7 +169,8 @@ _FEEDBACK_PARSING_SYSTEM = """기존 정산 정보에 피드백을 반영하라.
 - 할증/추가 부담 조건(지각, 늦은 도착 등)은 반드시 명시적으로 언급된 참여자에게만 surcharge_rate를 할당하라.
   예) "C가 20% 더 낸다" → C에게만 surcharge_rate: 0.2 할당. A, B, D는 건드리지 않는다.
 - 산술 계산은 수행하지 말고, 조건과 rate 변경 사항만 추출하라
-- 감액 조건(소비 덜 함)은 discount_rate, 할증 조건(지각 등 패널티)은 surcharge_rate(비율) 또는 surcharge_amount(고정금액) 사용
+- 감액 조건(소비 덜 함)은 discount_rate, 할증 조건(지각·벌금·패널티 등 추가 부담)은 surcharge_rate(비율) 또는 surcharge_amount(고정금액) 사용
+  예) "A한테 벌금 5000원" → surcharge_amount: 5000 / "B 패널티 20%" → surcharge_rate: 0.2
 
 감액 수치 기준표 (반드시 이 표를 따를 것):
 | 사용자 표현                       | discount_rate |
@@ -173,6 +179,16 @@ _FEEDBACK_PARSING_SYSTEM = """기존 정산 정보에 피드백을 반영하라.
 | 조금 먹음 / 적게 먹음 / 소량 섭취 | 0.5           |
 | 반만 먹음 / 절반 정도             | 0.5           |
 위 표에 해당하지 않는 모호한 표현은 discount_rate: null로 설정하라.
+
+target_items 설정 규칙 (반드시 준수):
+- 감액 예외는 반드시 어느 항목에 적용되는지 target_items를 지정해야 한다. 절대 빈 배열로 두지 말라.
+- "술 / 마셨어 / 음주" 관련 → 기존 items 중 주류 계열 항목명을 넣는다. 예) ["주류"]
+- "안주 / 먹었어 / 음식 / 고기" 관련 → 기존 items 중 안주 계열 항목명을 넣는다. 예) ["안주"]
+- "중도 귀가 / 일찍 감 / 자리를 비움" → 기존 items 전체를 넣는다.
+- 명확하지 않으면 기존 items 전체를 target_items에 넣는다.
+
+예시) 기존 items가 [주류, 안주]이고 "D가 술을 전혀 안 마셨어" 피드백을 받은 경우:
+{"name": "D", "exceptions": [{"type": "술 미섭취", "target_items": ["주류"], "discount_rate": 1.0}]}
 
 - 금액 명시 시 surcharge_amount, 비율 명시 시 surcharge_rate (둘을 동시에 쓰지 말라)
 - 모든 rate는 0.0~1.0 범위, surcharge_amount는 0 이상 정수로 결정하라
@@ -286,7 +302,10 @@ def _post_validate_exceptions(parsed: dict) -> dict:
     2. discount_rate null → 타입 키워드로 rate 추론 교정
     3. target_items 동의어 정규화 (술→주류 등)
     """
-    SURCHARGE_KEYWORDS = {"지각", "늦은 도착", "늦게", "late", "지각비", "늦음", "늦은"}
+    SURCHARGE_KEYWORDS = {
+        "지각", "늦은 도착", "늦게", "late", "지각비", "늦음", "늦은",
+        "벌금", "패널티", "penalty", "추가 부담", "더 내", "벌칙",
+    }
     # 감액 키워드 → discount_rate 매핑 (모호한 null 보정용)
     DISCOUNT_NULL_CORRECTION = [
         ({"미섭취", "안 마심", "안 먹음", "전혀"}, 1.0),
@@ -318,6 +337,16 @@ def _post_validate_exceptions(parsed: dict) -> dict:
                     if any(kw in exc_type for kw in keywords):
                         exc["discount_rate"] = rate
                         break
+
+            # discount 예외에 target_items가 비어 있거나 없을 때 type 키워드로 항목명 추론.
+            # LLM이 "D가 술을 안 마셨어" 같은 피드백에서 target_items를 빈 배열로 반환하면
+            # _calc_step1의 조건(item_name in target_items)이 절대 참이 되지 않아 감액이 누락된다.
+            if "discount_rate" in exc and not exc.get("target_items") and all_item_names:
+                inferred = []
+                for canonical, syns in ITEM_SYNONYMS.items():
+                    if canonical in all_item_names and any(s in exc_type for s in syns):
+                        inferred.append(canonical)
+                exc["target_items"] = inferred if inferred else list(all_item_names)
 
         # 할증 예외 중복 병합 (피드백 시 LLM이 기존 null 할증을 갱신하지 않고
         # 새 할증을 덧붙이는 경우 방어 — 가장 구체적인 값 하나만 남긴다)
@@ -443,6 +472,7 @@ def _build_change_summary(prev_amounts: dict, participants_out: list) -> str:
 
 
 def input_parsing_node(state: SettlementState) -> dict:
+    # [LLM 사용] 자연어 → 구조화 JSON 변환. LLM이 rate를 잘못 분류하는 경우를 _post_validate_exceptions가 코드 레벨에서 보정한다.
     content = _call_llm(_INPUT_PARSING_SYSTEM, state["raw_input"], tag="INPUT_PARSING")
     parsed = _extract_json(content)
     parsed = _post_validate_exceptions(parsed)
@@ -450,13 +480,24 @@ def input_parsing_node(state: SettlementState) -> dict:
 
 
 def safety_check_node(state: SettlementState) -> dict:
+    # [LLM 미사용] 파싱 결과의 모순·누락을 규칙 기반으로 차단하는 게이트. 오염된 입력이 계산 단계로 넘어가지 않게 막는다.
     pj = state.get("parsed_json", {})
 
     def _exit(error: str) -> dict:
         return {"safety_error": error}
 
+    if pj.get("off_topic"):
+        return _exit(
+            "이 서비스는 모임 정산 전용입니다.\n"
+            "인원, 총액, 예외 조건을 포함한 정산 내용을 입력해주세요.\n"
+            "예) \"A, B, C 세 명이서 6만원 냈어. 주류 3만원, 안주 3만원. C가 술을 안 마셨어.\""
+        )
+
     if not pj.get("total_amount") or not pj.get("participants"):
-        return _exit("total_amount 또는 participants 정보가 누락되었습니다.")
+        return _exit(
+            "정산 정보를 찾을 수 없습니다. 인원수와 총 금액을 포함해 다시 입력해주세요.\n"
+            "예) \"A, B, C 세 명이서 6만원 냈어.\""
+        )
 
     # ── 중복 참여자 감지 ──
     names = [p["name"] for p in pj.get("participants", [])]
@@ -551,12 +592,8 @@ def safety_check_node(state: SettlementState) -> dict:
 
 
 def route_request_node(state: SettlementState) -> dict:
-    """전략 분기 (결정적). parsed_json만 보면 판정이 확정되므로 LLM을 쓰지 않는다.
-
-    - 선결제(prepaid) 또는 지원금(subsidy)이 있으면 SPONSOR (예외 파이프라인의 상위집합)
-    - 그 외 예외 조건이 하나라도 있으면 EXCEPTION
-    - 아무 예외도 없으면 SIMPLE
-    """
+    # [LLM 미사용] parsed_json의 prepaid·subsidy·exceptions 유무만으로 전략이 확정되므로 결정적 코드로 분기한다.
+    # SPONSOR(선결제/지원금) > EXCEPTION(예외 조건) > SIMPLE(균등 분배) 우선순위.
     pj = state.get("parsed_json", {})
     participants = pj.get("participants", [])
     has_subsidy = bool(pj.get("subsidy", 0))
@@ -573,6 +610,7 @@ def route_request_node(state: SettlementState) -> dict:
 
 
 def calculation_node(state: SettlementState) -> dict:
+    # [LLM 미사용] 금액 산술은 LLM이 아닌 calculator/ 엔진에 전담시킨다 (핵심 설계 원칙).
     return {"calculation_result": calculate(state["parsed_json"])}
 
 
@@ -669,6 +707,8 @@ def _build_explanation(cr: dict, parsed_json: dict) -> str:
 
 
 def report_generation_node(state: SettlementState) -> dict:
+    # 계산 근거(calc_explanation)는 _build_explanation으로 코드 조립 — LLM에 숫자를 맡기지 않기 위함.
+    # 공유 메시지(final_report)만 [LLM 사용] — 최종 금액 목록을 카카오톡용 자연어로 변환한다.
     cr = state.get("calculation_result", {})
     pj = state.get("parsed_json", {})
     calc_explanation = _build_explanation(cr, pj) if cr else ""
@@ -725,12 +765,8 @@ def report_generation_node(state: SettlementState) -> dict:
 
 
 def feedback_intent_node(state: SettlementState) -> dict:
-    """피드백 입력의 의도를 분류한다 (modify_exception / reset / complaint).
-
-    - complaint: 직전 결과를 자가 진단해 되묻기 메시지를 만들어 흐름을 종료한다.
-    - reset: 기존 이력을 비우고 새 정산(input_parsing)으로 라우팅한다.
-    - modify_exception: 기존 흐름(feedback_parsing)으로 진행한다.
-    """
+    # [LLM 사용] 피드백 의도를 modify_exception / reset / complaint 세 갈래로 분류한다.
+    # 의도별 후속 행동이 달라지므로(조건 수정 / 새 정산 / 되묻기) 문맥 추론이 필요하다.
     raw = state["raw_input"]
     content = _call_llm(_FEEDBACK_INTENT_SYSTEM, raw, temperature=0, tag="FEEDBACK_INTENT")
     try:
@@ -752,6 +788,8 @@ def feedback_intent_node(state: SettlementState) -> dict:
 
 
 def feedback_parsing_node(state: SettlementState) -> dict:
+    # [LLM 사용] 기존 parsed_json을 보존하면서 새로 언급된 조건만 반영한다.
+    # "언급 없는 참여자는 건드리지 말라"는 선택적 수정이 필요해 LLM 문맥 추론을 사용한다.
     old_pj = state.get("parsed_json", {})
     old_names = [p["name"] for p in old_pj.get("participants", [])]
     history = state.get("feedback_history") or []
